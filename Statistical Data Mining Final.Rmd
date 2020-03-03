@@ -1,0 +1,1182 @@
+---
+title: "Classification of Men's Basketball NCAA Tournament Wins"
+author: "John Thomas, Ning Xie, Sam Luxenberg"
+date: "5/1/2019"
+output:
+   pdf_document:
+      fig_caption: true
+      number_sections: FALSE
+---
+
+
+\vspace{.5in}
+\tableofcontents 
+\vspace{.5in}
+
+----------------
+
+\vspace{.5in}
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Introduction
+The competition we are working with is Google Cloud & NCAA? ML Competition 2019-Men's Challenge. For this competition, kagglers forecast the outcomes of the 2019 NCAA Division I Men's Basketball Championship tournament.
+
+Since the 2019 tournament has come and gone, the tournament year we choose to predict does not really matter. To better align ourselves with the course objectives and thereby better utlize the techniques learned in class, we've opted to adapt the research question at hand. Instead of prediction, we made this a classification problem and challenged ourselves to analyze the various variables and see which ones contribute most to a winning game. Because we have the results of all the tournament games through 2018 from Kaggle, we will use historical regular season and tournament data to predict the outcomes of the 2017 and 2018 tournaments. 
+
+For the training set, we will be combining regular season game-level and tournament game-level basektball data together with matchup data. As we will see below, our training dataset contains each matchup twice, where the first half will be what we call the winners dataset and the second half will be the losers dataset. We are duplicating these matchups to eliminate any bias in the data that skews results towards winners or losers. While the matchups will be duplicated, the regular season game-level and tournament game-level features in each obervation will be from the perspective of Team1 which will be the winner in the winners dataset and the loser in the losers dataset. Similarly, Team2 will be the loser in the winners dataset and the winner in the losers dataset. 
+
+## The Dataset
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+rm(list=ls())
+path1 <- 'C:/Users/Samuel/Documents/GW/Data Mining/Final_Project/mens-machine-learning-competition-2019/Stage2DataFiles'
+path2 <- 'C:/Users/Samuel/Documents/GW/Data Mining/Final_Project/mens-machine-learning-competition-2019/MasseyOrdinals_thru_2019_day_128'
+path3 <- 'C:/Users/Samuel/Documents/GW/Data Mining/Final_Project/mens-machine-learning-competition-2019'
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+
+library(Ckmeans.1d.dp)
+library(tidyverse)
+library(dplyr)
+library(randomForest)
+library(caret)
+library(ROCR)
+library(gridExtra)
+library(ggExtra)
+library(xgboost)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+teams <- read.csv(paste(path1,"Teams.csv",sep='/'), stringsAsFactors = FALSE)
+seeds <- read.csv(paste(path1,"NCAATourneySeeds.csv",sep='/'), stringsAsFactors = FALSE)
+tourney <- read.csv(paste(path1,"NCAATourneyDetailedResults.csv",sep='/'), stringsAsFactors = FALSE)
+regular <- read.csv(paste(path1,"RegularSeasonDetailedResults.csv", sep='/'), stringsAsFactors = FALSE)
+conference <- read.csv(paste(path1,"TeamConferences.csv", sep='/'), stringsAsFactors = FALSE)
+rank <- read.csv(paste(path2,"MasseyOrdinals_thru_2019_day_128.csv", sep='/'), stringsAsFactors=FALSE)
+```
+
+In our project, we have several seperate data sources which we eventually merge together. These data sources are named "team", "seeds", "tourney", "regular", "conference" and "rank". Let's consider each of them individually. 
+
+The `teams` dataset contains the `TeamID`, `TeamName`, `FirstD1Season` which is the season this particular team first became a division-1 school (highest level of college basketball) for men's basketball, and `LastD1Season` which is the last season this particular team was division-1. There are 4 variables and 366 observations in the `team` dataset.
+
+The `seeds` dataset contains the `Season`, the `Seed` which combines both the region in the tournament and the actual seed number, and `TeamID`. There are 5 variables and 2286 observations in the `seeds` dataset.
+
+The `tourney` dataset contains game-level data for both the winning and losing teams of tournment games from 2003 to 2018. There are 35 variables and 1048 observations in the `tourney` dataset.
+
+The `regular` dataset contains game-level data for both the winning and losing teams of regular season games from 2003 to 2019. There are 35 variables and 87504 observations in the `regular` dataset.
+
+The `conference` dataset contains the `Season`, `TeamID`, and `ConfAbbrev` which is the abbreviation for the conference the team is in. There are 3 variables and 11241 observations in the `conference` dataset.
+
+The `rank` dataset contains the `Season`, `RankingDayNum` which is the day of the season this team was ranked, `SystemName` which is the particular system under which the team is ranked, `TeamID`, and `OrdinalRank` which is the actual rank. There are 5 variables and 3,798,256 observations in the `rank` dataset.
+
+Once we merge everything together, the final training dataset has 165,910 observations and 26 variables and the testing dataset has 268 observations with the same variables.
+
+Note that we chose not to include team IDs as a factor variable (nor as a variable in general) because of both model and time constraints. We feel if there were some kind of team history or name intimidation factor psychologically going on, it would probably be captured in our rankings and conferences features. 
+
+Since the ranking dataset only has ranks for the regular season, we will use seeds as a proxy for rankings in tournament games.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Find mean rank on a given day
+mean_rank <- rank %>%
+  group_by(Season, TeamID, RankingDayNum) %>%
+  filter(Season >= 2003) %>%
+  summarize(rank = mean(OrdinalRank))
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Use seeds from tournament games as a proxy for rank from regular season games
+seeds$region <- substring(seeds$Seed,1,1)
+seeds$rank <- as.numeric(substring(seeds$Seed,2,3))
+seeds_sep <- seeds %>%
+  filter(Season >= 2003) %>%
+  dplyr::select(Season,TeamID,region,rank)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+
+# Create home, away, neutral location feature for losing teams
+regular$LLoc <- ifelse(regular$WLoc=='H', 'A', 
+                       ifelse(regular$WLoc=='N', 'N', 'H'))
+
+# Join - conference
+regular_conf <- regular %>%
+  left_join(conference,by=c("Season"="Season","WTeamID"="TeamID"))
+colnames(regular_conf)[length(names(regular_conf))] <- "Wconf"
+regular_conf <- regular_conf %>%
+  left_join(conference,by=c("Season"="Season","LTeamID"="TeamID"))
+colnames(regular_conf)[length(names(regular_conf))] <- "Lconf"
+regular_conf$conf_diff <- ifelse(regular_conf$Wconf == regular_conf$Lconf, 0 ,1)
+```
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+## Regular Season Winner Dataset
+
+regular_W <- regular_conf %>%
+  filter(Season < 2019) %>%
+  dplyr::select(Season, DayNum, WTeamID, WScore, LTeamID, LScore,WLoc, NumOT,
+         Wconf, Lconf, conf_diff,
+         WFGM, WFGA, WFGM3, 
+         WFGA3, WFTM, WFTA,
+         WOR, WDR, WAst, 
+         WTO, WStl, WBlk, WPF) %>%
+  mutate(Team1ID = WTeamID,
+         Team2ID = LTeamID,
+         #Team1Score = WScore, duplicates result feature
+         #Team2Score = LScore, duplicates result feature
+         conf1 = Wconf,
+         conf2 = Lconf,
+         Loc = WLoc, # Game Location
+         #FGM = WFGM, # Field Goals Made, too similar to points scored
+         FGA = WFGA, # Field Goals Attempted
+         FGM3 = WFGM3, # 3-Point Field Goals Made
+         FGA3 = WFGA3, # 3-Point Field Goals Attempted
+         FG3_PCT = WFGM3 / WFGA3,
+         FTM = WFTM, # Free-Throws Made
+         FTA = WFTA, # Free-Throws Attempted
+         FT_PCT = ifelse(WFTA==0, 0, WFTM / WFTA),
+         OR = WOR, # Offensive Rebounds
+         DR = WDR, # Defensive Rebounds
+         Ast = WAst, # Assists
+         TO = WTO, # Turnovers
+         Ast_to_TO = ifelse(WTO==0, WAst / .1, WAst / WTO), # Assist-to-Turnover Ratio
+         Stl = WStl, # Steals
+         Blk = WBlk, # Blocks
+         PF = WPF # Personal Fouls
+         ) %>% 
+  dplyr::select(-c(WTeamID, WScore, Wconf, Lconf, LTeamID, LScore, WLoc,
+            WFGM, WFGA, WFGM3, WFGA3, WFTM, WFTA,
+            WOR, WDR, WAst, WTO, WStl, WBlk, WPF)) %>%
+  mutate(tourney_game = 0,
+         result = 1)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Regular Season Winner Dataset Team Rankings
+
+# Team1 rankings
+regular_W_daily_rank <- regular_W %>%
+   group_by(Season, Team1ID) %>%
+   left_join(mean_rank, by=c('Season'='Season', 'Team1ID'='TeamID', 'DayNum'='RankingDayNum')) %>%
+  fill(rank) %>%
+  fill(rank, .direction='up') %>%
+  ungroup()
+colnames(regular_W_daily_rank)[length(names(regular_W_daily_rank))] <- 'rank1'
+regular_W_daily_rank$rank1[is.na(regular_W_daily_rank$rank1)] <- 350
+
+# Team2 rankings
+regular_W_daily_rank <- regular_W_daily_rank %>%
+  group_by(Season, Team2ID) %>%
+  left_join(mean_rank, by=c('Season'='Season', 'Team2ID'='TeamID', 'DayNum'='RankingDayNum')) %>%
+  fill(rank) %>% 
+  fill(rank, .direction='up') %>%
+  ungroup()
+colnames(regular_W_daily_rank)[length(names(regular_W_daily_rank))] <- 'rank2'
+regular_W_daily_rank$rank2[is.na(regular_W_daily_rank$rank2)] <- 350
+
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Regular Season Loser Dataset
+
+regular_L <- regular_conf %>%
+  filter(Season < 2019) %>%
+  dplyr::select(Season, DayNum, WTeamID, WScore, LTeamID, LScore, LLoc, NumOT, 
+         Wconf, Lconf, conf_diff,
+         LFGM, LFGA, LFGM3, 
+         LFGA3, LFTM, LFTA,
+         LOR, LDR, LAst, 
+         LTO, LStl, LBlk, LPF) %>%
+  mutate(Team1ID = LTeamID,
+         Team2ID = WTeamID,
+         #Team1Score = LScore, duplicates result feature
+         #Team2Score = WScore, duplicates result feature
+         conf1 = Lconf, 
+         conf2 = Wconf,
+         Loc = LLoc,
+         #FGM = LFGM, too similar to points scored
+         FGA = LFGA, 
+         FGM3 = LFGM3,
+         FGA3 = LFGA3,
+         FG3_PCT = LFGM3 / LFGA3,
+         FTM = LFTM,
+         FTA = LFTA,
+         FT_PCT = ifelse(LFTA==0, 0, LFTM / LFTA),
+         OR = LOR,
+         DR = LDR,
+         Ast = LAst,
+         TO = LTO,
+         Ast_to_TO = ifelse(LTO==0, LAst / .1, LAst / LTO),
+         Stl = LStl,
+         Blk = LBlk,
+         PF = LPF) %>%
+  dplyr::select(-c(WTeamID, WScore, LTeamID, LScore, Lconf, Wconf, LLoc,
+            LFGM, LFGA, LFGM3, LFGA3, LFTM, LFTA,
+            LOR, LDR, LAst, LTO, LStl, LBlk, LPF)) %>%
+  mutate(tourney_game = 0, 
+         result = 0)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+## Regular Season Loser Team Rankings
+
+# Team1 rankings
+regular_L_daily_rank <- regular_L %>%
+   group_by(Season, Team1ID) %>%
+   left_join(mean_rank, by=c('Season'='Season', 'Team1ID'='TeamID', 'DayNum'='RankingDayNum')) %>%
+  fill(rank) %>%
+  fill(rank, .direction='up') %>%
+  ungroup()
+colnames(regular_L_daily_rank)[length(names(regular_L_daily_rank))] <- 'rank1'
+regular_L_daily_rank$rank1[is.na(regular_L_daily_rank$rank1)] <- 350
+
+# Team2 rankings
+regular_L_daily_rank <- regular_L_daily_rank %>%
+  group_by(Season, Team2ID) %>%
+  left_join(mean_rank, by=c('Season'='Season', 'Team2ID'='TeamID', 'DayNum'='RankingDayNum')) %>%
+  fill(rank) %>% 
+  fill(rank, .direction='up') %>%
+  ungroup()
+colnames(regular_L_daily_rank)[length(names(regular_L_daily_rank))] <- 'rank2'
+regular_L_daily_rank$rank2[is.na(regular_L_daily_rank$rank2)] <- 350
+
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Combine winners and losers datasets
+regular_combined <- rbind(regular_W_daily_rank, regular_L_daily_rank)
+
+```
+
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Make winners and losers tournament data
+tourney$LLoc <- ifelse(tourney$WLoc=='H', 'A', 
+                       ifelse(tourney$WLoc=='N', 'N', 'H'))
+
+# Join - conference
+tourney_conf <- tourney %>%
+  left_join(conference,by=c("Season"="Season","WTeamID"="TeamID"))
+colnames(tourney_conf)[length(names(tourney_conf))] <- "Wconf"
+tourney_conf <- tourney_conf %>%
+  left_join(conference,by=c("Season"="Season","LTeamID"="TeamID"))
+colnames(tourney_conf)[length(names(tourney_conf))] <- "Lconf"
+tourney_conf$conf_diff <- ifelse(tourney_conf$Wconf == tourney_conf$Lconf, 0 ,1)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+## Tournament Winner Dataset
+tourney_W <- tourney_conf %>%
+  filter(Season < 2019) %>%
+  dplyr::select(Season, DayNum, WTeamID, WScore, LTeamID, LScore,WLoc, NumOT, 
+         Wconf, Lconf, conf_diff,
+         WFGM, WFGA, WFGM3, 
+         WFGA3, WFTM, WFTA,
+         WOR, WDR, WAst, 
+         WTO, WStl, WBlk, WPF) %>%
+  mutate(Team1ID = WTeamID,
+         Team2ID = LTeamID,
+         #Team1Score = WScore, duplicates result feature
+         #Team2Score = LScore, duplicates result feature
+         conf1 = Wconf,
+         conf2 = Lconf,
+         Loc = WLoc, # Game Location
+         #FGM = WFGM, # Field Goals Made, too similar to points scored
+         FGA = WFGA, # Field Goals Attempted
+         FGM3 = WFGM3, # 3-Point Field Goals Made
+         FGA3 = WFGA3, # 3-Point Field Goals Attempted
+         FG3_PCT = WFGM3 / WFGA3,
+         FTM = WFTM, # Free-Throws Made
+         FTA = WFTA, # Free-Throws Attempted
+         FT_PCT = ifelse(WFTA==0, 0, WFTM / WFTA),
+         OR = WOR, # Offensive Rebounds
+         DR = WDR, # Defensive Rebounds
+         Ast = WAst, # Assists
+         TO = WTO, # Turnovers
+         Ast_to_TO = ifelse(WTO==0, WAst / .1, WAst / WTO), # Assist-to-Turnover Ratio
+         Stl = WStl, # Steals
+         Blk = WBlk, # Blocks
+         PF = WPF # Personal Fouls
+         ) %>% 
+  dplyr::select(-c(WTeamID, WScore, LTeamID, LScore, Wconf, Lconf, WLoc,
+            WFGM, WFGA, WFGM3, WFGA3, WFTM, WFTA,
+            WOR, WDR, WAst, WTO, WStl, WBlk, WPF)) %>%
+  mutate(tourney_game = 1, 
+         result = 1)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Tournament Winner Dataset Team Rankings
+
+# Team1 rankings
+tourney_W_daily_rank <- tourney_W %>%
+  group_by(Season, Team1ID) %>%
+  left_join(seeds_sep, by=c("Season"="Season", "Team1ID"="TeamID")) %>%
+  ungroup() %>%
+  dplyr::select(-c(region))
+colnames(tourney_W_daily_rank)[length(tourney_W_daily_rank)] <- 'rank1'
+
+# Team2 rankings
+tourney_W_daily_rank <- tourney_W_daily_rank %>%
+  group_by(Season, Team2ID) %>%
+  left_join(seeds_sep, by=c("Season"="Season", "Team2ID"="TeamID")) %>%
+  ungroup() %>%
+  dplyr::select(-c(region))
+colnames(tourney_W_daily_rank)[length(tourney_W_daily_rank)] <- 'rank2'
+```
+ 
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Tournament Loser Dataset
+
+tourney_L <- tourney_conf %>%
+  filter(Season < 2019) %>%
+  dplyr::select(Season, DayNum, WTeamID, WScore, LTeamID, LScore,LLoc, NumOT, 
+         Wconf, Lconf, conf_diff,
+         LFGM, LFGA, LFGM3, 
+         LFGA3, LFTM, LFTA,
+         LOR, LDR, LAst, 
+         LTO, LStl, LBlk, LPF) %>%
+  mutate(Team1ID = LTeamID,
+         Team2ID = WTeamID,
+         #Team1Score = LScore, duplicates result feature
+         #Team2Score = WScore, duplicates result feature
+         conf1 = Lconf, 
+         conf2 = Wconf,
+         Loc = LLoc, 
+         #FGM = LFGM, too similar to points scored
+         FGA = LFGA, 
+         FGM3 = LFGM3,
+         FGA3 = LFGA3,
+         FG3_PCT = LFGM3 / LFGA3,
+         FTM = LFTM,
+         FTA = LFTA,
+         FT_PCT = ifelse(LFTA==0, 0, LFTM / LFTA),
+         OR = LOR,
+         DR = LDR,
+         Ast = LAst,
+         TO = LTO,
+         Ast_to_TO = ifelse(LTO==0, LAst / .1, LAst / LTO),
+         Stl = LStl,
+         Blk = LBlk,
+         PF = LPF) %>%
+  dplyr::select(-c(WTeamID, WScore, LTeamID, LScore, Lconf, Wconf, LLoc,
+            LFGM, LFGA, LFGM3, LFGA3, LFTM, LFTA,
+            LOR, LDR, LAst, LTO, LStl, LBlk, LPF)) %>%
+  mutate(tourney_game = 1,
+         result = 0)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+## Tournament Loser Dataset Team Rankings
+
+# Team1 rankings
+tourney_L_daily_rank <- tourney_L %>%
+  group_by(Season, Team1ID) %>%
+  left_join(seeds_sep, by=c("Season"="Season", "Team1ID"="TeamID")) %>%
+  ungroup() %>%
+  dplyr::select(-c(region))
+colnames(tourney_L_daily_rank)[length(tourney_L_daily_rank)] <- 'rank1'
+
+# Team2 rankings
+tourney_L_daily_rank <- tourney_L_daily_rank %>%
+  group_by(Season, Team2ID) %>%
+  left_join(seeds_sep, by=c("Season"="Season", "Team2ID"="TeamID")) %>%
+  ungroup() %>%
+  dplyr::select(-c(region))
+colnames(tourney_L_daily_rank)[length(tourney_L_daily_rank)] <- 'rank2'
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+tourney_combined <- rbind(tourney_W_daily_rank, tourney_L_daily_rank)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Split tournament data
+tourney_train <- tourney_combined %>%
+  filter(Season <= 2016)
+tourney_test <- tourney_combined %>%
+  filter(Season %in% c(2017, 2018))
+
+# Create a training set
+train <- rbind(regular_combined, tourney_train)
+
+
+```
+
+Since we mostly just care about what happens in the March Madness tournament, we will be predicting/classifying game results for the 2017 and 2018 tournaments using regular season data from 2003-2018 as well as tournament data from 2003-2016 for training models. 
+
+We hope to shed light on some of the contributing factors to winning an NCAA basketball game, and further, what contributes specifically to winning a tournament game. For this reason, we have excluded variables that would result in almost perfect direct correlation with the result of who wins and who loses the game.In particular, we have excluded points scored and field goals made for both the winning and losing teams. Note that we chose to leave in free-throws made and three-pointers made as teams can win or lose with varying amounts of these. We have also tried to account for tournament game pressure versus regular season game pressure by including the `tourney_game` flag feature. 
+
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# convert strings to factors
+
+
+## Note: This model CAN be run with or without teams. Takes longer to run (355 levels), and only adds about .01 to AUC. 
+## We still might want to show this...
+
+
+# train$Team1ID <- as.factor(train$Team1ID)
+# train$Team2ID <- as.factor(train$Team2ID)
+# levels(train$Team1ID) <- make.names(levels(train$Team1ID))
+# levels(train$Team2ID) <- make.names(levels(train$Team2ID))
+#  
+# tourney_test$Team1ID <- as.factor(tourney_test$Team1ID)
+# tourney_test$Team2ID <- as.factor(tourney_test$Team2ID)
+# levels(tourney_test$Team1ID) <- make.names(levels(tourney_test$Team1ID))
+# levels(tourney_test$Team2ID) <- make.names(levels(tourney_test$Team2ID))
+
+train$conf1 <- as.factor(train$conf1)
+train$conf2 <- as.factor(train$conf2)
+tourney_test$conf1 <- as.factor(tourney_test$conf1)
+tourney_test$conf2 <- as.factor(tourney_test$conf2)
+levels(train$conf1) <- make.names(levels(train$conf1))
+levels(train$conf2) <- make.names(levels(train$conf2))
+levels(tourney_test$conf1) <- make.names(levels(tourney_test$conf1))
+levels(tourney_test$conf2) <- make.names(levels(tourney_test$conf2))
+train$Loc <- as.factor(train$Loc)
+tourney_test$Loc <- as.factor(tourney_test$Loc)
+
+train$result <- as.factor(train$result)
+tourney_test$result <- as.factor(tourney_test$result)
+levels(train$result) <- c('L', 'W')
+levels(tourney_test$result) <- c('L', 'W')
+
+``` 
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Let's remove the team variables because as factors they force the algorithms to take a very long time.
+train <- train %>%
+  dplyr::select(-c(Team1ID, Team2ID))
+tourney_test <- tourney_test %>%
+  dplyr::select(-c(Team1ID, Team2ID))
+
+# Let's create a model without any offensive features. 
+train_def <- train %>% 
+  dplyr::select(-c("FGA", "FGM3", "FGA3", "FG3_PCT", "FTM", "FTA", "FT_PCT", "OR", "Ast", "TO", "Ast_to_TO"))
+tourney_test_def <- tourney_test %>%
+  dplyr::select(-c("FGA", "FGM3", "FGA3", "FG3_PCT", "FTM", "FTA", "FT_PCT", "OR", "Ast", "TO", "Ast_to_TO"))
+
+train_def$Loc <- as.factor(train_def$Loc)
+tourney_test_def$Loc <- as.factor(tourney_test_def$Loc)
+train_def$result <- as.factor(train_def$result)
+tourney_test_def$result <- as.factor(tourney_test_def$result)
+levels(train_def$result) <- c('L', 'W')
+levels(tourney_test_def$result) <- c('L', 'W')
+```
+
+
+
+
+
+
+
+
+
+# Exploratory Data Analysis
+
+## PCA
+```{r include= FALSE}
+train_for_pca <- train %>%
+  dplyr::select(-c(Season, result))
+
+train_for_pca_matrix <- model.matrix(~., data=train_for_pca)
+train_for_pca_matrix <- train_for_pca_matrix[,-1] # remove intercept column
+train_pca <- prcomp(train_for_pca_matrix, scale=TRUE, center=TRUE)
+train_pca$sdev / (train_pca$sdev %>% sum)
+cumsum(train_pca$sdev / (train_pca$sdev %>% sum))
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Look at the strongest relations between different features and the first 3 principal components
+tail(train_pca$rotation[order(abs(train_pca$rotation[,1])),1:3], 30)
+```
+Let us look at the strongest relations between different features and the first 3 principal components
+Based on the above principal components, the first component is generally associated with in-game basketball statistics. In particular there is moderate correlation with 3-pointers made and attempted, assists and turnovers, as well as the ranks of the two teams in a match-up. One potential explanation for this component is that since larger values of this component are associated with lower-ranked teams and larger assist-to-turnover ratios as well as more 3-pointers, these teams, in general, take care of the ball and try to play efficiently. Perhaps, these are jump-shooting teams that share the ball well and don't have a unique star player who dominates. 
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+tail(train_pca$rotation[order(abs(train_pca$rotation[,2])),1:3], 30)
+```
+
+The second component is moderately positively correlated with the ranks of both teams in the match-up as well as 3-pointers, assists, game location, and match-ups that are not tournament games (this can be seen by the negative correlation with neutral location games as well as negative correlation with the `tourney_game` feature).  
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+tail(train_pca$rotation[order(abs(train_pca$rotation[,3])),1:3], 30)
+```
+
+The third component is moderately negatively correlated with free-throws, rebounds, blocks, fouls, steals, number of overtimes, home-court advantage, and positively correlated with the rank. This component seems to be explaining match-ups that are close and physical games where there are clear advantages to being home or away. While difficult to directly measure and quantify, most players feel home-court advantage truly is an advantage because players feed of the energy of the home crowds. At the end of close games when players are tired, home crowds could be giving their team extra energy to play more aggressive both on the offensive end by drawing fouls and on the defensive which translate to more steals, fouls, blocks, and rebounds. Perhaps, this component is explaining the interaction between crowd energy and the physicalness of the match-up.
+
+All this is nice, but we need to keep in mind that the first 3 principal components only account for about 6% of the variation in the data, so any conclusions from the above analysis should be taken with a grain of salt. 
+
+### Visualizing PCA
+```{r echo=FALSE, message=FALSE, warning=FALSE,}
+train_pca_df <- as.data.frame(train_pca$x) 
+train_pca_df$result <- train$result
+```
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+train_pca_df %>% ggplot() +
+  geom_point(mapping=aes(x=train_pca_df$PC1,
+                         y=train_pca_df$PC2,
+                         colour=factor(train_for_pca_matrix[,91],
+                         labels=c('regular', 'tournament')))) +
+  labs(color='Game Type')
+```
+
+Tournament games definitely seem to have lower PC2 values than regular season games. These account for ranks with lower values (meaning better teams matched up against each). This is exactly what happens in the NCAA tournament.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+train_pca_df %>% ggplot() +
+  geom_point(mapping=aes(x=train_pca_df$PC1,
+                         y=train_pca_df$PC3,
+                         colour=factor(train_for_pca_matrix[,91],
+                         labels=c('regular', 'tournament')))) +
+  labs(color='Game Type')
+```  
+
+Between the first and third principal components, there's more variation than between the first and the second. In particular, this variation comes from the PC3  direction. 
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+train_pca_df %>% ggplot() +
+  geom_point(mapping=aes(x=train_pca_df$PC2,
+                         y=train_pca_df$PC3,
+                         colour=train$Loc)) +
+  labs(color='Game Type') 
+
+```
+
+Home and away games tend to be associated with larger PC2 values, whereas neutral location games tend to have lower PC2 values. 
+
+
+### Home-Court Advantage
+Since we are interested in how the home-court advantage will affect the game, we continue with more exploratory analysis below as we seek the relationship between performance and home-court advantage.  
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+FTA1 <- train %>%
+        ggplot() +
+        geom_density(mapping=aes(x=FTA, fill=Loc), alpha=1/10) +
+        labs(title = "FTA by Game Location", x= "Free Throw Attempted", y= "", fill = "Location")
+FTA2 <- train %>%
+        ggplot() +
+        geom_density(mapping=aes(x=FT_PCT, fill=Loc), alpha=1/10) +
+        labs(title = "FT_PCT by Game Location",x = "Free Throw Percentage", fill = "Location")
+grid.arrange(FTA1,FTA2,ncol=2)
+```
+
+From these plots, we can see that more free-throws tend to be attemped on home-court. 
+There seems to be slightly higher free-throw percentage for teams on their home-courts. This makes sense because when opposing players are at the foul lines, they may become distracted by fans making noise and waving objects for the sole purpose of distraction. 
+ 
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+data.frame(train$result,train$Loc) %>%
+  ggplot()+
+  geom_bar(mapping = aes(x = train$result, y = ..count.., fill = train$Loc ), position = position_dodge())+
+  labs(title = "Relationship between Result and Location", x = "Result", y = "Times", fill = "location")
+```
+
+Away teams do tend to lose significantly more than home teams. 
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+train %>% 
+  ggplot() +
+  geom_bar(mapping=aes(x=Blk, y=..prop.., fill=Loc), position=position_dodge()) +
+  labs(title = "Blocks in Home and Away Games",x = "Blocks", y="Proportion", fill = "Location")
+
+
+```
+
+We see here that home teams tend to have slightly more blocks than away teams. Many times, in basketball, blocks are energizing plays for both the crowds and the players. If a team already has home-court advantage, blocks could potentially be worth more for the home team versus what they're worth for the away team. The neutral location games can be seen as a kind of average between the away and home percentages since no team has a real advantage. 
+
+### Tournament Games Pressure 
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+train %>% 
+        ggplot() +
+        geom_bar(mapping=aes(x=FTM, y=..prop.., fill=as.factor(tourney_game)), position=position_dodge()) +
+        labs(title = "FTM and Game Type", x = "Free Throw Made", fill = "Game Type (Tournament = 1)")
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+train %>% 
+        ggplot() +
+        geom_density(mapping=aes(x=FT_PCT, fill=as.factor(tourney_game)), alpha=1/5) +
+        labs(title = "FTM and Game Type", x = "Free Throw Percentage", fill = "Game Type (Tournament = 1)")
+
+```
+
+In the above two plots, we see tournament games have slightly better free-throw percentages, meaning teams tend to perform well under tournament pressure at the foul line. 
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+train %>%
+  ggplot() +
+  geom_density(mapping=aes(x=FG3_PCT, fill=as.factor(tourney_game)), alpha=1/5) +
+  labs(title = "3-Point Field Goals and Game Type", x = "3-Point Field Goal Percentage", fill = "Game Type (Tournament = 1)")
+```
+
+There is not too much of an effect that tournament games have on 3-point shooting.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+train %>%
+  ggplot() +
+  geom_density(mapping=aes(x=log(Ast_to_TO), fill=as.factor(tourney_game)), alpha=1/5)+
+  labs(title = "Assist-to-Turnover Ratio and Game Type", x = "Log of Assist-to-Turnover Ratio", fill = "Game Type (Tournament = 1)")
+
+```
+
+Teams seem to take care of the ball and have better overall offensive execution in tournament games. They tend to have more turnovers during the regular season than during the tournament. 
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+train %>%
+  ggplot() +
+  geom_density(mapping=aes(x=PF, fill=as.factor(tourney_game)), alpha=1/5) +
+  labs(title = "Personal Fouls and Game Type", x = "Personal Fouls", fill = "Game Type (Tournament = 1)")
+```
+
+There are somewhat fewer personal fouls called in the tournament. While this could be describing teams being less aggressive, it could also be a function of how the referees call games during the tournament versus the regular season. 
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+train %>%
+  group_by(DayNum) %>%
+  summarize(mean_Ast_to_TO = mean(Ast_to_TO)) %>%
+    ggplot() +
+    geom_line(mapping=aes(x=DayNum, y=mean_Ast_to_TO)) +
+    labs(y = "Average Assist-to-Turnover Ratio", x = "Day of the Season")
+  
+```
+
+All in all, it seems like teams perform better in the the tournament. This makes sense since only the best teams in the country are playing in the tournament, so we should expect everything to be at least slightly better. These teams also prepare all year with the goal for having real success in the tournament if they make it, so their performance should be improving throughout the year and hopefully peak during the tournament. We can see this phenomenon in the graph above where the tournament begins around day 135. Some of the extra variation during the tournament can probably be attributed to the fact that the number of teams has decreased from several hundred to 64. Note that an assist is worth somewhere between 2 and 3 points, so improvement in a team's assist-to-turnover ratio is an indicator of improvment in overall offense.
+
+
+
+# Individual Models
+
+###Logistic Regression
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+model1 <- glm(result ~ .,data=train,family="binomial")
+
+model1 %>%
+  summary
+
+model1_pred_train <- model1 %>%
+  predict(train, type="response") %>%
+  prediction(labels=train$result)
+
+model1_pred_train_ensemble <- model1 %>%
+  predict(train, type="response") 
+  
+
+model1_pred_test <- model1 %>% 
+  predict(tourney_test,type="response") %>% 
+  prediction(labels=tourney_test$result)
+
+
+model1_pred_test_ensemble <- model1 %>% 
+  predict(tourney_test,type="response")
+```
+
+Logisitc Regression AUC: `r performance(model1_pred_test,"auc")@y.values[[1]]`
+
+
+
+```{r echo=FALSE, warning=FALSE, include=TRUE}
+logreg_plot <- performance(model1_pred_test,'tpr','fpr')
+plot(logreg_plot)
+
+```
+
+###LDA
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+library(MASS)
+model2 <- lda(result~.,data = train)
+model2
+
+model2_pred_train <- model2 %>%
+  predict(train) %>%
+  (function(x) x$posterior[,2]) %>%
+  prediction(labels=train$result)
+
+model2_pred_train_ensemble <- model2 %>%
+  predict(train) %>%
+  (function(x) x$posterior[,2])
+
+model2_pred_test <- model2 %>% 
+  predict(tourney_test) %>% 
+  (function(x) x$posterior[,2]) %>% 
+  prediction(labels=tourney_test$result)
+
+
+
+model2_pred_test_ensemble <- model2 %>% 
+  predict(tourney_test) %>% 
+  (function(x) x$posterior[,2]) 
+
+
+```
+
+
+LDA AUC: `r performance(model2_pred_test,"auc")@y.values[[1]]`
+
+
+
+```{r echo=FALSE, warning=FALSE}
+lda_plot <- performance(model2_pred_test,'tpr','fpr')
+plot(lda_plot)
+
+```
+
+
+###QDA
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+model3 <- qda(result~.,data = train)
+model3
+
+model3_pred_train <- model3 %>%
+  predict(train) %>%
+  (function(x) x$posterior[,2]) %>%
+  prediction(labels=train$result)
+
+model3_pred_test <- model3 %>% 
+  predict(tourney_test) %>% 
+  (function(x) x$posterior[,2]) %>% 
+  prediction(labels=tourney_test$result)
+
+
+
+```
+
+QDA AUC: `r performance(model3_pred_test,"auc")@y.values[[1]]`
+
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+qda_plot <- performance(model3_pred_test,'tpr','fpr')
+plot(qda_plot)
+```
+
+
+###Decision Trees
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+library(tree)
+library(dplyr)
+#R limits the max levels of a categorical variable to 32; we can model.matrix later if w think it's worth it but for now, I will remove Wconf and L conf
+
+train_tree <- train %>%
+  dplyr::select(-c("conf1","conf2"))
+
+test_tourney_tree <- tourney_test %>%
+  dplyr::select(-c("conf1","conf2"))
+
+set.seed(111)
+model.tree <- tree(result~., data= train_tree)
+tree.prune <- prune.misclass(model.tree, best =3)
+
+tree.pred.train <- prediction(predictions = as.numeric(predict(tree.prune, train_tree, type = 'class')),
+labels = as.numeric(train_tree$result))                            
+model4_pred_train <- tree.pred.train
+
+
+
+
+
+# Get test set predictions for ensembling
+tree.pred.test <- prediction(predictions=as.numeric(predict(tree.prune, test_tourney_tree, type='class')),
+                             labels=as.numeric(test_tourney_tree$result))
+model4_pred_test <- tree.pred.test
+
+
+
+```
+
+Decision Tree AUC: `r performance(model4_pred_test, 'auc')@y.values[[1]]`
+
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+tree_plot <- performance(model4_pred_test,'tpr','fpr')
+plot(tree_plot)
+
+```
+
+
+###XGBoost
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE, results= "hide"}
+
+# Note XGBoost can't handle factor variables with only one level
+train_for_xgboost <- train %>%
+  dplyr::select(-c(conf1, conf2, tourney_game, Loc, result))
+train_for_xgboost_matrix <- model.matrix(~., data=train_for_xgboost)[,-1]
+
+train_def_for_xgboost <- train_def %>%
+  dplyr::select(-c(conf1, conf2, tourney_game, Loc, result))
+train_def_for_xgboost_matrix <- model.matrix(~., data=train_def_for_xgboost)[,-1]
+
+test_for_xgboost <- tourney_test %>%
+  dplyr::select(-c(conf1, conf2, tourney_game, Loc, result))
+test_for_xgboost_matrix <- model.matrix(~., data=test_for_xgboost)[,-1]
+
+test_def_for_xgboost <- tourney_test_def %>%
+  dplyr::select(-c(conf1, conf2, tourney_game, Loc, result))
+test_def_for_xgboost_matrix <- model.matrix(~., data=test_def_for_xgboost)[,-1]
+
+d_train <- train_for_xgboost_matrix %>% 
+  xgb.DMatrix(label=(as.integer(train$result)-1))
+d_train_def <- train_def_for_xgboost_matrix %>%
+  xgb.DMatrix(label=(as.integer(train_def$result)-1))
+
+
+d_test <- test_for_xgboost_matrix %>%
+  xgb.DMatrix(label=(as.integer(tourney_test$result)-1))
+d_test_def <- test_def_for_xgboost_matrix %>%
+  xgb.DMatrix(label=(as.integer(tourney_test_def$result)-1))
+
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE, results= "hide"}
+tune_grid <- expand.grid(nrounds = 150, #c(50, 100, 150, 250, 300)
+                   max_depth = 15, # c(2,4,6,10,15,20)
+                   eta = 0.1,
+                   gamma = 1,
+                   colsample_bytree = .7,
+                   min_child_weight = 50,
+                   subsample = .3) # c(.3, .5, .7, 1)
+
+tune_control <- caret::trainControl(method='cv', number=3)
+xgb_tune <- caret::train(x=train_for_xgboost_matrix, 
+                         y=train$result,
+                         trControl=tune_control, 
+                         tuneGrid=tune_grid, 
+                         method='xgbTree'
+                         )
+
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE, results= "hide"}
+depth <- 15
+shrinkage <- .1
+gamma <- 1
+colSample <- .7
+minChildWeight <- 50
+nrounds <- 150
+subSample <- .3
+set.seed(876)
+model5_xgb <- xgboost(params=list(max_depth=depth, 
+                                 eta=shrinkage,
+                                 gamma=gamma,
+                                 colsample_by_tree=colSample,
+                                 min_child_weight=minChildWeight,
+                                 subsample=subSample),
+                     data=d_train,
+                     nrounds=150,
+                     objective='binary:logistic',
+                     eval_metric='auc')
+```
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE, results= "hide"}
+# XGBoost Model for Defenseive variables
+set.seed(564)
+model5_xgb_def <- xgboost(params=list(max_depth=depth, 
+                                 eta=shrinkage,
+                                 gamma=gamma,
+                                 colsample_by_tree=colSample,
+                                 min_child_weight=minChildWeight,
+                                 subsample=subSample),
+                     data=d_train_def,
+                     nrounds=150,
+                     objective='binary:logistic',
+                     eval_metric='auc')
+```
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE, results= "hide"}
+model5_pred_train <- predict(model5_xgb, d_train) %>%
+  prediction(labels=train$result)
+model5_pred_test <- predict(model5_xgb, d_test) %>%
+  prediction(labels=tourney_test$result)
+
+
+model5_pred_train_ensemble <- predict(model5_xgb, d_train)
+model5_pred_test_ensemble <- predict(model5_xgb, d_test)
+```
+
+XGBoost AUC: `r performance(model5_pred_test,"auc")@y.values[[1]]`
+
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+xgb_plot <- performance(model5_pred_test, 'tpr', 'fpr')
+plot(xgb_plot)  
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE, results= "hide"}
+model5_xgb_def_pred_test <- predict(model5_xgb_def, d_test_def) %>%
+  prediction(labels=tourney_test_def$result)
+```
+
+XGBoost Defense AUC: `r  performance(model5_xgb_def_pred_test, "auc")@y.values[[1]]`
+
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+xgb_def_plot <- performance(model5_xgb_def_pred_test, 'tpr', 'fpr')
+plot(xgb_def_plot)
+```
+
+
+**XGBoost Feature Importance**
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE, results= "hide"}
+# XGBoost Feature Importance
+feature_importance <- xgb.importance(colnames(train), model=model5_xgb)
+xgb.ggplot.importance(feature_importance)
+```
+
+
+
+**Two More XGBoost Models for Ensembling**
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE, results= "hide"}
+# Let's run 2 more XGBoost Models to ensemble in the next step.
+
+set.seed(32)
+model6_xgb <- xgboost(params=list(max_depth=depth, 
+                                 eta=shrinkage,
+                                 gamma=gamma,
+                                 colsample_by_tree=colSample,
+                                 min_child_weight=minChildWeight,
+                                 subsample=subSample),
+                     data=d_train,
+                     nrounds=150,
+                     objective='binary:logistic',
+                     eval_metric='auc')
+
+model6_pred_train <- predict(model6_xgb, d_train) %>%
+  prediction(labels=train$result)
+model6_pred_test <- predict(model6_xgb, d_test) %>%
+  prediction(labels=tourney_test$result)
+
+model6_pred_train_ensemble <- predict(model6_xgb, d_train)
+model6_pred_test_ensemble <- predict(model6_xgb, d_test)
+
+set.seed(123)
+model7_xgb <- xgboost(params=list(max_depth=depth, 
+                                 eta=shrinkage,
+                                 gamma=gamma,
+                                 colsample_by_tree=colSample,
+                                 min_child_weight=minChildWeight,
+                                 subsample=subSample),
+                     data=d_train,
+                     nrounds=150,
+                     objective='binary:logistic',
+                     eval_metric='auc')
+
+model7_pred_train <- predict(model7_xgb, d_train) %>%
+  prediction(labels=train$result)
+model7_pred_test <- predict(model7_xgb, d_test) %>%
+  prediction(labels=tourney_test$result)
+
+model7_pred_train_ensemble <- predict(model7_xgb, d_train)
+model7_pred_test_ensemble <- predict(model7_xgb, d_test)
+
+```
+
+XGBoost Model 2 AUC: `r  performance(model6_pred_test, "auc")@y.values[[1]]`
+
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+model6_xgb_plot <- performance(model6_pred_test, 'tpr', 'fpr')
+plot(model6_xgb_plot)
+```
+
+XGBoost Model 3 AUC: `r  performance(model7_pred_test, "auc")@y.values[[1]]`
+
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+model7_xgb_plot <- performance(model7_pred_test, 'tpr', 'fpr')
+plot(model7_xgb_plot)
+```
+
+## Ensemble Models
+Since the QDA and the Decision Tree models didn't perform as well as the others we won't be including them in our ensemble models. 
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE, results= "hide"}
+
+new_train <- data.frame(result = train$result, 
+                        model1_pred = model1_pred_train_ensemble,
+                        model2_pred = model2_pred_train_ensemble,
+                        model5_pred = model5_pred_train_ensemble,
+                        model6_pred = model6_pred_train_ensemble,
+                        model7_pred = model7_pred_train_ensemble)
+
+new_test <- data.frame(result = tourney_test$result,
+                       model1_pred = model1_pred_test_ensemble,
+                       model2_pred = model2_pred_test_ensemble, 
+                       model5_pred = model5_pred_test_ensemble, 
+                       model6_pred = model6_pred_test_ensemble,
+                       model7_pred = model7_pred_test_ensemble)
+```
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE, results= "hide"}
+# Random Forest Stack Model
+set.seed(42)
+modelrf_stack <- randomForest(result~., data=new_train, mtry=3, ntree=200)
+modelrf_stack_pred_train <- predict(modelrf_stack, newdata=new_train, type='prob')[,2] %>%
+  prediction(labels=new_train$result)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE, results= "hide"}
+# Random Forest Train AUC
+performance(modelrf_stack_pred_train, 'auc')@y.values[[1]]
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE, results= "hide"}
+modelrf_stack_pred_test <- predict(modelrf_stack, newdata=new_test, type='prob')[,2] %>%
+  prediction(labels=new_test$result)
+
+```
+
+Random Forest Ensemble Model AUC: `r performance(modelrf_stack_pred_test, 'auc')@y.values[[1]]`
+
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+modelrf_stack_plot <- performance(modelrf_stack_pred_test, 'tpr', 'fpr')
+plot(modelrf_stack_plot)
+
+```
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE, results= "hide"}
+# XGBoost Stack Model
+d_new_train <- new_train %>%
+  dplyr::select(-result) %>%
+  as.matrix %>%
+  xgb.DMatrix(label=(as.integer(new_train$result)-1))
+
+d_new_test <- new_test %>%
+  dplyr::select(-result) %>%
+  as.matrix %>%
+  xgb.DMatrix(label=(as.integer(new_test$result)-1))
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE, results= "hide"}
+set.seed(128)
+model_xgb_stack <- xgboost(params=list(max_depth=depth,
+                                       eta=shrinkage,
+                                       gamma=gamma,
+                                       colsample_bytree=colSample,
+                                       min_child_weight=minChildWeight,
+                                       subsample=subSample),
+                           data=d_new_train,
+                           nrounds=150, 
+                           objective="binary:logistic",
+                           eval_metric="auc")
+
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE, results= "hide"}
+# XGBoost Train AUC
+model_xgb_stack_pred_train <- predict(model_xgb_stack, d_new_train) %>%
+  prediction(labels=new_train$result)
+performance(model_xgb_stack_pred_train, 'auc')@y.values[[1]]
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE, results= "hide"}
+# XGBoost Test AUC
+model_xgb_stack_pred_test <- predict(model_xgb_stack, d_new_test) %>%
+  prediction(labels=new_test$result)
+performance(model_xgb_stack_pred_test, 'auc')@y.values[[1]]
+
+```
+
+XGBoost Ensemble Model AUC: `r performance(model_xgb_stack_pred_test, 'auc')@y.values[[1]]`
+
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+model_xgb_stack_plot <- performance(model_xgb_stack_pred_test, 'tpr', 'fpr')
+plot(model_xgb_stack_plot)
+```
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE, results= "hide"}
+# Logistic Regression Stack Model
+model_logreg_stack <- glm(result~., data=new_train, family='binomial')
+model_logreg_stack %>% summary
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE, results= "hide"}
+model_logreg_stack_pred_train <- model_logreg_stack %>%
+  predict(new_train, type='response') %>%
+  prediction(labels=new_train$result)
+performance(model_logreg_stack_pred_train, 'auc')@y.values[[1]]
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE, results= "hide"}
+model_logreg_stack_pred_test <- model_logreg_stack %>%
+  predict(new_test, type='response') %>%
+  prediction(labels=new_test$result)
+performance(model_logreg_stack_pred_test, 'auc')@y.values[[1]]
+```
+
+Logistic Regression Ensemble Model AUC: `r performance(model_logreg_stack_pred_test, 'auc')@y.values[[1]]`
+
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+model_logreg_stack_plot <- performance(model_logreg_stack_pred_test, 'tpr', 'fpr')
+plot(model_logreg_stack_plot)
+```
+
+
+#Discussion
+
+This exercise in classifying college basketball games as wins or losses ultimately relied on five different models ensembled together. Once we combined the predictions of the logistic regression, LDA, and three tuned XGBoost models, we tried three different models for the final layer. In the end we had a final layer of a logistic regression, a random forest, and an XGBoost. The initial logistic regression model actually performed the best of all the models we tried (ensembled or not) rendering an AUC score of *`r performance(model1_pred_test, 'auc')@y.values[[1]]`* on the test data. We tried QDA and decision tree models in our initial tests, but their respective AUC scores were hovering around .70 and .80, so we elected not to inlcude them in our ensemble models.
+
+Our goal in classifying these games was to identify which variables contributed most to a winning game and the results were fairly consistent across the models. As seen above, we rely on our pre-ensembled models to show significance in variables, be it through normal significance testing in logistic regression, size of LDA coefficients, or XGBoost Feature Importance.
+
+The most significant variables in classifying a game as a win as determined by all models are as follows:
+
+-FTA (Free Throws Attempted)
+
+-DR (Defensive Rebounds)
+
+-Blk (Blocks)
+
+-FGM3 (3-Point Field Goals Made)
+
+-Stl (Steals)
+
+-FGA (Field Goals Attempted)
+
+-Ast (Assists)
+
+Ultimately, the match-up features like rankings, conferences, and game location don't have as significant an effect as the actual basketball statistics, however, this does not necessarily mean they should not be accounted for. These could have small effects on the psychological environments the players play in, and in close games these could potentially be the slight edge that one team needs to defeat their opponent.
+
+
+*Note: We did not check for multicolinearity or normality, or constant covariance between the two classes, which would be necessary in a full-scale statistical analysis and in making precise interpretations on logistic regression and LDA.*
+
+While our work here was extensive, there are many different avenues we can take this dataset down in further study. Knowing the information about what variables are relevant is extremely beneficial to understanding the initial problem given from the actual Kaggle competition. Since we now have models that will classify completed games based on our variables, we could then potentially aggregate the statistics for each team and then for any given match-up predict the outcome. Additionally, we briefly looked at a subset of the dataset containing only defensive statistics (defensive rebounds, steals, blocks, personal fouls) and matchup-up features, and no offensive features (3-pointers made, free-throws made, offensive rebounds, assists, etc.). If we had more time it would have been interesting to look at how much defensive stats contribute to a win in more detail. That being said, another reason we did not go down this route was because there were only a few variables pertaining to defense within our dataset. However when we ran these defense and match-up only models, we did manage to get AUC scores between .80 and .90, so these could theoretically be used to classify wins with some level of accuracy. The late Alabama football coach said "offense wins games...defense wins championships," so in the future, it would be great to show specifically which defensive traits are most valuable in the context of defense itself.  
+
+We were able to apply a number of methods learned in class to this final model. Between logistic regression, LDA, and XGBoost we did have satisfying results. That being said we would have liked to have added both random forests and support vector machines to the model as well, but sadly these methods took an extremely long amount of time to run. We ran SVM over the course of 12 hours straight and it still continued to run. It would have been great to use SVM because we could have fine tuned the parameters to best complement our data. Same goes for tuning random forests. As a whole our team thoroughly enjoyed the assignment and are proud of our final model.
+
+
+
+
